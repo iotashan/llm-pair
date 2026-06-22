@@ -203,13 +203,18 @@ occurrences** of the same value so cross-references survive, and keep the mappin
 **stable across all rounds** of the same pairing session.
 
 **Map ownership & leakage surface.** The placeholder→real map lives in the
-coordinator's working memory (optionally a local sidecar like
-`$J.pii-map.json` that is **never** named in any peer command, prompt, or
-`--add-dir`). Redacted content is all that may appear in: `/tmp` prompt/output
+coordinator's working memory. Do **NOT** write it under `/tmp` (or any peer-staging
+path): `/tmp` is world-readable, so a `pii-map.json` there would re-leak every secret
+you just redacted. If persistence is unavoidable, use a coordinator-private dir
+**outside** `/tmp/llmpair-*` (`mkdir -m700`; file `chmod 600`), never named in any peer
+command, prompt, or `--add-dir`, and delete it when the session ends. Redacted content
+is all that may appear in: `/tmp` prompt/output
 files, zellij pane scrollback, stderr/`.err` files, parse-error messages. After
 assembling a peer prompt, **grep it for known sensitive tokens** before dispatch
 (belt-and-suspenders). Re-expand placeholders **only** in Claude's integrated
-output / internal reasoning — never echo the map back into a peer prompt.
+output, file edits, and user-facing summaries — never echo the map back into a peer
+prompt. **Secrets** (keys/tokens/passwords) stay as placeholders even in user-facing
+output unless the user explicitly needs the value.
 
 **If a task has no sensitive data** (e.g. editing a generic open-source skill), say
 so ("redaction pass: nothing to redact") and send raw. Don't over-redact to where
@@ -272,7 +277,11 @@ polls `/tmp`. The user watches the panes; the coordinator reads the files.
 > file for the live view, then `wait` for the real exit code.
 
 ```bash
-J="/tmp/llmpair-$$"                      # unique per call; STAGE ON /tmp, never on /Volumes
+J="$(mktemp -u /tmp/llmpair-<peer>-XXXXXX)"   # PER PEER + unique. In 3-way, codex & gemini
+                                              # MUST get DISTINCT $J or they clobber each other's
+                                              # prompt/out/done (correctness + cross-peer leak).
+# PREFLIGHT before launch: $J.prompt.txt exists & non-empty; (Codex) $J.schema.json is valid
+# JSON; the peer binary is on PATH. A missing/empty prompt is a STAGING bug, not peer-unavailable.
 # 1. Write $J.prompt.txt (REDACTED for third-party peers) with the file-write tool.
 #    For Codex also write $J.schema.json (its --output-schema needs a file).
 # 2. Job script — robust background + tail + wait (no process substitution):
@@ -280,9 +289,10 @@ cat > "$J.sh" <<EOF
 #!/bin/bash
 echo "START \$(date)" > "$J.log"
 echo ">>> <peer> LIVE — progress streams below; final -> $J.out"
+: > "$J.out"; : > "$J.err"                     # pre-create: BSD/macOS 'tail -f' exits if file is absent
 <PEER COMMAND>  > "$J.out" 2> "$J.err" &      # see adapter for <PEER COMMAND>
 P=\$!
-tail -f "$J.err" 2>/dev/null &                # live view in the pane
+tail -f "$J.err" 2>/dev/null &                # live view in the pane (file already exists)
 T=\$!
 wait \$P; E=\$?
 sleep 1; kill \$T 2>/dev/null
@@ -306,8 +316,9 @@ appears. **Never run the CLI as one long blocking/background `sh()` call** (e.g.
 `sh('codex exec …', 480000)`): an `xhigh`/Pro-High run routinely outlasts the tool
 timeout, the call returns empty, and the result is lost even though the peer
 finished — the exact failure this pane+sentinel pattern prevents. **Last resort if
-zellij is unavailable:** stage on `/tmp` and capture stdout *directly through the
-call's return value* (`out = sh('cat "$J.prompt.txt" | <peer cmd>')`) — never write
+zellij is unavailable:** run the adapter's `<PEER COMMAND>` directly and capture its
+stdout *through the call's return value* (`out = sh(<PEER COMMAND>)` — it already
+includes the `cat "$J.prompt.txt" | …` stdin plumbing) — never write
 the OUTPUT to a `/Volumes/*` file and read it back later (read-after-write lag).
 
 **For three-way work, launch BOTH panes (codex + gemini) in parallel**, then poll
@@ -375,8 +386,11 @@ consensus, and fallback are shared and unchanged across adapters.
   (Gemini wraps JSON in conversational filler): (1) strict `JSON.parse` of stdout →
   (2) first fenced ```json block → (3) first balanced `{...}` → (4) else preserve
   raw as `unstructured_advice`, mark `schema_valid:false`, never invent fields.
-- **No `-s read-only`; read-only is enforced by discipline:**
+- **No `-s read-only`; safety is by DISCIPLINE, not a sandbox** (treat Gemini as
+  *no-filesystem-intended, not sandbox-enforced*):
   - Inline the entire artifact in the prompt; the peer needs no filesystem access.
+    Where practical, launch `agy` from an empty throwaway dir so there's nothing local
+    to read.
   - **Do NOT pass `--add-dir`** — it would let Gemini read beyond the redacted
     prompt, breaking the read-only/privacy guarantee.
   - **Do NOT pass `--dangerously-skip-permissions`.**
@@ -388,8 +402,10 @@ consensus, and fallback are shared and unchanged across adapters.
 - print-mode **stdout is clean** (no progress noise — unlike Codex), which makes the
   defensive parse easier; `$J.err` is usually empty on success.
 - **Availability:** unavailable if `agy` not on PATH; or timed out (`--print-timeout`
-  hit / no `$J.done` past deadline); or `$J.out` empty/unparseable after one retry;
-  or `$J.err`/`$J.out` matches `rate.?limit|quota|RESOURCE_EXHAUSTED|429|unauthenticated|permission`.
+  hit / no `$J.done` past deadline); or `$J.out` **empty** after one retry; or
+  `$J.err`/`$J.out` matches `rate.?limit|quota|RESOURCE_EXHAUSTED|429|unauthenticated|permission`.
+  A **non-empty but unparseable** `$J.out` is *available-but-malformed* (keep as
+  `unstructured_advice`), **not** unavailable — don't trigger Opus on its account.
   **Note:** a rate-limited `agy` may exit **0** with empty/garbage stdout — so check
   stdout-emptiness AND grep stderr, don't trust the exit code alone.
 
@@ -547,12 +563,15 @@ intended := peers from the fan-out matrix for this verdict
 for each peer in intended: attempt once (bounded); classify result
   -> usable result        : keep
   -> unavailable           : drop (rate-limit / auth / timeout / not-on-PATH / empty)
-  -> available but garbage : retry once; still garbage -> treat as no usable result
+  -> available but malformed: retry once; still malformed -> keep as cautious
+                             residual risk; do NOT fall to Opus on its account
 
-if any third-party peer produced a usable result:
+if any intended peer produced a usable result:
     proceed with those + the coordinator        # NO Opus, even if the other peer died
-elif single-peer tier and primary(codex) down but gemini up:
-    substitute gemini at the tier-equivalent rung   # substitute, not a 2nd peer
+elif single-peer tier (intended = codex only) and codex unavailable:
+    PROBE gemini now (it was NOT in the intended set); if up, substitute it at the
+    tier-equivalent rung (a substitute, not a 2nd peer; don't re-add codex if it recovers).
+    if gemini also unavailable -> fall through to both-down
 elif BOTH codex AND gemini unavailable:
     spawn ONE previous-gen Opus agent (raw content, fresh context) as the sole peer
 else:
