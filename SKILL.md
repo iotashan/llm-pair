@@ -1,153 +1,228 @@
 ---
 name: llm-pair
 description: >-
-  Use for ALL pairing with a peer LLM. Triggers: the user says "pair with codex",
-  "pair up with codex", "pair with the LLM", "llm-pair", or "co-develop with a
-  second model" — OR proactively during substantial defined task/ticket work at
-  the plan, work-item-review, and blocker boundaries. Runs the peer (Codex /
-  GPT-5.x via `codex exec`, read-only) and calibrates its model + reasoning effort
-  to the task — cheap/fast models for small work, max for plans — instead of
-  burning the top model on everything. Self-throttles via a `skip` verdict on
-  trivial work. Iterates to consensus.
+  Use for ALL pairing with peer LLMs. Triggers: the user says "pair with codex",
+  "pair with gemini", "pair with the LLM", "llm-pair", "three-way", or
+  "co-develop with a second model" — OR proactively during substantial defined
+  task/ticket work at the plan, work-item-review, and blocker boundaries. Runs up
+  to TWO read-only peers — Codex / GPT-5.x (`codex exec`) and Google Gemini
+  (`agy`, the Antigravity CLI) — calibrating each peer's model + reasoning effort
+  to the task, and fans out to BOTH for complex work (planning + `big`) so the
+  coordinating Claude reconciles a three-way consensus. Redacts sensitive data to
+  stable placeholders before anything reaches a third-party peer. Self-throttles
+  via a `skip` verdict on trivial work. Falls back to previous-gen Opus only when
+  BOTH external peers are unavailable.
 ---
 
-# llm-pair — calibrated pairing with a peer LLM
+# llm-pair — calibrated pairing with peer LLMs
 
-Pair the main agent with a **peer LLM** (the "pair") to raise quality through
-independent drafting, adversarial review, and consensus — **without** spending
-the most expensive model + maximum reasoning on every change.
+Pair the main agent (the **coordinator**, this Claude) with one or two **peer
+LLMs** to raise quality through independent drafting, adversarial review, and
+consensus — **without** spending the most expensive model + maximum reasoning on
+every change, and **without** leaking sensitive data to third parties.
 
-The pair backend is **Codex** (GPT-5.x), invoked directly via the `codex` CLI
-(`codex exec`). The concept is backend-agnostic; see
-[Portability](#portability--swapping-the-pair-backend).
+Two peer backends:
 
-## The two problems this solves
+- **Codex** (GPT-5.x) via the `codex` CLI (`codex exec`) — the primary peer.
+- **Gemini** via the `agy` CLI (Google Antigravity) — joins for **complex** work
+  (planning + `big`) to give a genuinely different model's perspective.
 
-1. **Cost calibration.** Run at max (top model + `xhigh`) on everything and a
-   one-line fix gets the same super-review as a risky migration; the usage window
-   evaporates. This skill picks a **(model, reasoning-effort) tier** sized to the
-   task.
-2. **Reliability.** Pin the pair to **read-only**, a fixed **working directory**,
-   **structured JSON output**, and **verified non-empty results** — and **never
-   confabulate** a result the pair didn't actually return.
+The coordinator runs ALL the back-and-forth and is the **executive synthesizer**:
+peers advise; Claude reconciles, decides, and integrates. (The name "llm-pair" is
+now a mild misnomer — complex work is a three-way panel — but the name stays.)
+
+## The problems this solves
+
+1. **Cost calibration.** Running at max (top model + `xhigh`) on everything gives a
+   one-line fix the same super-review as a risky migration; the usage window
+   evaporates. This skill picks a **(model, effort) tier** sized to the task, per
+   backend, and only fans out to the second peer when the stakes justify it.
+2. **Reliability.** Pin peers to **read-only**, a fixed **working directory**,
+   **structured output**, and **verified non-empty results** — and **never
+   confabulate** a result a peer didn't actually return.
+3. **Privacy.** Codex (OpenAI) and Gemini (Google) are **third parties**. Redact
+   sensitive data to stable placeholders **before** building their prompts, keep
+   the map coordinator-local, and re-expand on return. (The Opus fallback is
+   Anthropic — same trust boundary as the coordinator — and is exempt.)
+4. **Model diversity.** A second, architecturally different model catches what one
+   model (and the coordinator) are blind to — the whole point of a panel.
 
 ---
 
-## CONFIG — the tier ladder (edit this block to tune)
+## Non-negotiable safety rules
 
-The classifier returns a **verdict**; this table maps verdict → (model, effort).
-This table is the single source of truth. Verify model IDs against `codex` /
-your account; if a model is rejected, fall back one rung toward the stronger
-model and note it.
+1. **Peers are read-only advisors.** They never write your files. Codex is pinned
+   with `-s read-only`; Gemini has no such flag, so its safety comes from inlining
+   the artifact + a headless "use no tools" instruction + omitting
+   `--dangerously-skip-permissions` + **no `--add-dir`**. Give a peer write
+   capability only if the user explicitly asks it to patch something this turn.
+2. **Redact sensitive data before it reaches a third-party peer** (Codex, Gemini).
+   See [Sensitive-data redaction](#sensitive-data-redaction-protocol). This is a
+   hard gate, not best-effort.
+3. **Never confabulate.** If a peer returns nothing usable, report that — do not
+   invent its opinion or pass your own analysis off as the peer's.
 
-| verdict     | model                  | effort   | when                                                          |
-|-------------|------------------------|----------|--------------------------------------------------------------|
-| `skip`      | — (do not call pair)   | —        | trivial **and** zero risk signals — not worth pairing at all  |
-| `trivial`   | `gpt-5.3-codex-spark`  | `low`    | rename, comment, one-line tweak, isolated copy/config change  |
-| `small`     | `gpt-5.4-mini`         | `low`    | small, well-contained change, low blast radius                |
-| `normal`    | `gpt-5.5`              | `medium` | ordinary feature/fix, moderate scope                          |
-| `big`       | `gpt-5.5`              | `xhigh`  | large, cross-cutting, or high breakage risk                   |
+---
 
-**Effort floor is `low`.** `none`/`minimal` are rejected by the current Codex tool
-config (incompatible with the `web_search` tool) — never emit them.
+## CONFIG — tier ladders + fan-out (edit this block to tune)
+
+The classifier returns a **verdict**; these tables map verdict → (model, effort)
+per backend, and verdict → which peers to invoke. **This block is the single
+source of truth — exact model strings live here, never scattered in prose.**
+Verify model IDs against each CLI (`codex` / `agy models`); if a model is rejected,
+fall back one rung toward the stronger model and note it.
+
+### Codex ladder (`-m <model>` + `-c model_reasoning_effort=<effort>`)
+
+| verdict     | model                  | effort   | when                                                         |
+|-------------|------------------------|----------|-------------------------------------------------------------|
+| `skip`      | — (do not call peers)  | —        | trivial **and** zero risk signals — not worth pairing       |
+| `trivial`   | `gpt-5.3-codex-spark`  | `low`    | rename, comment, one-line tweak, isolated copy/config       |
+| `small`     | `gpt-5.4-mini`         | `low`    | small, well-contained change, low blast radius              |
+| `normal`    | `gpt-5.5`              | `medium` | ordinary feature/fix, moderate scope                        |
+| `big`       | `gpt-5.5`              | `xhigh`  | large, cross-cutting, or high breakage risk                 |
+
+**Codex effort floor is `low`.** `none`/`minimal` are rejected by the current Codex
+tool config (incompatible with the `web_search` tool) — never emit them.
+
+### Gemini ladder (`--model "<name> (<effort>)"` — effort is baked into the name)
+
+| verdict     | model string                | when                                            |
+|-------------|-----------------------------|-------------------------------------------------|
+| `trivial`   | `Gemini 3.5 Flash (Low)`    | substitute-only (see fan-out)                   |
+| `small`     | `Gemini 3.5 Flash (Medium)` | substitute-only                                 |
+| `normal`    | `Gemini 3.1 Pro (Low)`      | substitute-only                                 |
+| `big`       | `Gemini 3.1 Pro (High)`     | fan-out peer                                    |
+| `planning`  | `Gemini 3.1 Pro (High)`     | fan-out peer (fixed)                            |
+
+`agy models` is the authority for valid strings. Note Pro has **no Medium** tier.
+Under the default fan-out, Gemini is invoked only at `big`/planning; the lower rungs
+exist **only** for substitution (when Codex is down) — don't over-optimize unused
+paths, and don't silently upgrade a Codex outage on a small task to Pro High.
+
+### Fan-out matrix — who gets invoked (default: complex-only)
+
+| verdict     | peers invoked                       |
+|-------------|-------------------------------------|
+| `skip`      | none                                |
+| `trivial`   | codex                               |
+| `small`     | codex                               |
+| `normal`    | codex                               |
+| `big`       | **codex + gemini** (three-way)      |
+| planning    | **codex + gemini** (three-way)      |
+| blocker     | codex (gemini too if classified `big`) |
+
+To change the policy (e.g. "normal and up", or "always both"), edit this matrix —
+nothing else changes.
 
 **Fixed overrides (never run the classifier for these):**
 
-- **Planning** (overall plan, implementation plan, implementation pre-work) →
-  always `gpt-5.5 @ xhigh`.
-- **Blocker / error diagnosis** → classifier runs, but the **floor is `small`**
-  (never `skip` or `trivial`).
+- **Planning** (overall plan, implementation plan, pre-work) → **both peers**, codex
+  `gpt-5.5 @ xhigh` + gemini `Gemini 3.1 Pro (High)`. Define "planning" narrowly:
+  an explicit implementation/architecture plan or task decomposition requested
+  before code changes — **not** every passing "I'll do X" thought, which would
+  burn Gemini quota.
+- **Blocker / error diagnosis** → classifier runs, floor `small`; gemini joins only
+  if it classifies `big`.
 
-**Risk signals** (any one blocks `skip` and biases the verdict upward, often to
-`big`): auth / authz / sessions, DB migrations or schema, money / billing /
-payments, shared libraries or widely-imported utilities, infra / CI / deploy,
-public API or contract changes, security-sensitive code, concurrency.
+**Risk signals** (any one blocks `skip`/`trivial` and biases the verdict upward,
+often to `big` — which also pulls in Gemini): auth / authz / sessions, DB
+migrations or schema, money / billing / payments, shared or widely-imported
+libraries, infra / CI / deploy, public API or contract changes, security-sensitive
+code, concurrency.
+
+---
+
+## Peer selection & substitution
+
+1. Classify → verdict. Read intended peer set from the **fan-out matrix**.
+2. Check each intended peer's [availability](#availability--fallback-state-machine).
+   Drop the unavailable ones.
+3. **If ≥1 third-party peer is available, proceed with those — no Opus.** A
+   three-way that loses one peer becomes a two-way (peer + Claude); don't block.
+4. **Substitution (single-peer tiers):** if the primary (Codex) is down but Gemini
+   is up, substitute Gemini at its **tier-equivalent** rung (trivial→Flash Low,
+   small→Flash Medium, normal→Pro Low) — a *substitute*, not a second peer. Don't
+   re-invoke both if Codex recovers mid-flow.
+5. **Opus fallback only if BOTH Codex and Gemini are unavailable** — see
+   [the state machine](#availability--fallback-state-machine).
 
 ---
 
 ## When to pair — granularity (read this first)
 
-**Pairing happens at the work-item boundary, not per edit.** Over-triggering
-burns the window faster than the old always-max default.
+**Pairing happens at the work-item boundary, not per edit.** Over-triggering burns
+the window faster than the old always-max default.
 
-- A ticket with 3–4 work items → pair ~3–4 times: **plan once** up front, then
-  **review each work item** as it reaches a coherent, complete state.
+- A ticket with 3–4 work items → pair ~3–4 times: **plan once** up front (three-way),
+  then **review each work item** as it reaches a coherent, complete state.
 - A single work item with a dozen edits → do **not** pair on each edit. Pair once,
   on the completed unit.
-- **Blocker pairing is reactive** — only when an error **survives 2+ fix
-  attempts** *or* **cascades into new errors**. Not the first failing test.
+- **Blocker pairing is reactive** — only when an error **survives 2+ fix attempts**
+  *or* **cascades into new errors**. Not the first failing test.
 
 ### Proactive triggering
 
-You do **not** wait for the user to say "pair with codex." During substantial
-**defined task work** (a ticket, a feature, "do XYZ-123"), invoke this skill at
-the boundaries above (plan / work-item review / blocker). The `skip` verdict +
-work-item granularity keep small work cheap or unpaired, so erring toward
-invoking is safe. Don't pair on pure questions or trivial one-off edits.
+You do **not** wait for the user to say "pair." During substantial **defined task
+work** (a ticket, a feature, "do XYZ-123"), invoke this skill at the boundaries
+above. The `skip` verdict + work-item granularity keep small work cheap or
+unpaired, so erring toward invoking is safe. Don't pair on pure questions or
+trivial one-off edits.
 
 ---
 
-## The four contexts
+## Sensitive-data redaction protocol
 
-| Context                         | Collaboration pattern              | Tier               |
-|---------------------------------|------------------------------------|--------------------|
-| Overall plan / implementation plan / pre-work | **Parallel-draft → converge** | **Fixed: `gpt-5.5 @ xhigh`** |
-| Implementation review           | **Draft → advisory review → integrate** | Classifier    |
-| Blocker / error diagnosis       | **Advisory diagnosis**             | Classifier, floor `small` |
+Codex and Gemini are **third parties**. Before their prompts are **assembled**,
+replace every sensitive value with a stable placeholder; keep the map
+coordinator-local; re-expand on return. The Opus fallback and the coordinator are
+Anthropic — they get **raw** content.
 
-The pair is **always read-only** — it advises; the main agent writes and
-integrates. Only give the pair write capability if the user explicitly asks it to
-patch something this turn.
+**Redact before assembly, not after.** Run redaction over each raw artifact
+(diff, error text, code, requirements, logs, filenames, stack traces) *as you build
+the peer prompt* — never as a final pass over a finished prompt string, or quoted
+logs / paths / tracebacks slip through. The redacted text is what gets written to
+the `/tmp` prompt file; the **raw text must never touch a peer-readable file**.
 
-### Context A — Planning (parallel-draft → converge)
+**What counts as sensitive (PII is one category):** people's names, emails, phones,
+postal addresses; **secrets** — API keys, tokens, passwords, cookies, bearer
+headers, private keys, DB connection strings; customer/account/user IDs; internal
+hostnames, private URLs, IPs; proprietary client/brand identifiers; home-directory
+paths that embed a username; anything the user marks sensitive. **When unsure,
+redact.** For secrets, never send even surrounding context that reveals the value —
+emit the placeholder only.
 
-Do **not** draft a plan and hand it to the pair for critique — that anchors it on
-your framing and you lose the approach you didn't consider. Instead:
+**Placeholder format — collision-resistant.** Use `__PII_<TYPE>_<N>__` (e.g.
+`__PII_PERSON_1__`, `__PII_EMAIL_2__`, `__PII_SECRET_3__`, `__PII_CLIENT_1__`,
+`__PII_HOST_1__`). Plain single brackets (`[PII_1]`) get mangled by models
+(`[ PII_1 ]`, markdown-link interpretation) so re-expansion misses them and broken
+code gets integrated — the double-underscore/alnum form survives tokenization
+intact. Reserve the `__PII_…__` pattern: if it already appears in the input, escape
+it first so user text can't collide. **Reuse the same placeholder for repeat
+occurrences** of the same value so cross-references survive, and keep the mapping
+**stable across all rounds** of the same pairing session.
 
-1. **Dispatch the pair's independent draft in the background** (run the `codex
-   exec` call below, or an Agent, asynchronously). Give it the **same source
-   material you have** (ticket, requirements, relevant code) but **not your
-   draft**. Use the plan schema.
-2. **While it runs, draft your own plan** independently.
-3. **Collect both, diff the ideas** — agreements, real disagreements, anything one
-   side caught that the other missed.
-4. **Iterate to consensus** (see [Consensus loop](#the-consensus-loop)) on the real
-   disagreements only.
-5. Present the converged plan + a short "what the pair caught / what we rejected"
-   note.
+**Map ownership & leakage surface.** The placeholder→real map lives in the
+coordinator's working memory (optionally a local sidecar like
+`$J.pii-map.json` that is **never** named in any peer command, prompt, or
+`--add-dir`). Redacted content is all that may appear in: `/tmp` prompt/output
+files, zellij pane scrollback, stderr/`.err` files, parse-error messages. After
+assembling a peer prompt, **grep it for known sensitive tokens** before dispatch
+(belt-and-suspenders). Re-expand placeholders **only** in Claude's integrated
+output / internal reasoning — never echo the map back into a peer prompt.
 
-Tier is **fixed at max** — planning is where deep reasoning pays for itself.
-
-### Context B — Implementation review (draft → advisory review → integrate)
-
-Triggered when a **work item reaches a complete state**.
-
-1. Build the signal pack and **classify**. If `skip`, say so and move on.
-2. Run the pair **read-only** at the classified tier over the work item's diff,
-   using the review schema. Findings ordered by severity, file:line, explicit "no
-   findings → say so."
-3. **Integrate** correct findings; push back on wrong ones.
-4. Iterate to consensus; present findings first, then "what we fixed / rejected."
-
-### Context C — Blocker / error diagnosis (advisory diagnosis)
-
-Triggered only by the reactive threshold (2+ failed fixes **or** cascading errors).
-
-1. Classify (floor `small`); wide blast radius → `big`.
-2. Run the pair **read-only** with the error, what you've tried, and the relevant
-   code, using the diagnosis schema. Ask for ranked root-cause hypotheses + a
-   concrete next probe — not a blind patch.
-3. Apply the fix yourself; if it fails, escalate a tier and re-pair.
+**If a task has no sensitive data** (e.g. editing a generic open-source skill), say
+so ("redaction pass: nothing to redact") and send raw. Don't over-redact to where
+the peer can't reason — preserve structure and types.
 
 ---
 
 ## The classifier (cheap, structured)
 
-Run one fast-model classification. In Claude Code, use the REPL `haiku()`
-shorthand with the schema below (clean structured output, ~free). The classifier
-returns the **verdict**; map verdict → model+effort via
-[CONFIG](#config--the-tier-ladder-edit-this-block-to-tune) — do **not** let the
-classifier invent a model ID.
+Run one fast-model classification. In Claude Code, use the REPL `haiku()` shorthand
+with the schema below. The classifier returns the **verdict**; map verdict →
+model+effort and peer set via [CONFIG](#config--tier-ladders--fan-out-edit-this-block-to-tune)
+— do **not** let the classifier invent a model ID.
 
 ```js
 const SCHEMA = {
@@ -163,60 +238,245 @@ const SCHEMA = {
 
 **Signal pack** — a compact summary, not the whole diff: the context (review vs
 blocker) + one-line task summary; `git diff --stat`; files touched and ±lines;
-visible risk flags (see CONFIG).
+visible risk flags. **Classify on redacted signals if the summary contains
+sensitive data** (the classifier is local Haiku, so raw is acceptable, but stay
+consistent).
 
-**Rules:** any risk flag → `skip`/`trivial` off the table; blocker → floor
-`small`; **explicit user override wins** ("pair on max", `--tier big`, a named
-model/effort) → skip the classifier. Surface the verdict + rationale in one line
-before dispatching ("Classified review as `small` → gpt-5.4-mini @ low").
+**Rules:** any risk flag → `skip`/`trivial` off the table; blocker → floor `small`;
+**explicit user override wins** ("pair on max", `--tier big`, "three-way", a named
+model) → skip the classifier. Surface the verdict + chosen peers in one line before
+dispatching ("Classified review as `big` → codex gpt-5.5@xhigh + gemini Pro High").
 
 ---
 
-## Hardened invocation — the `codex exec` contract
+## The shared dispatch engine (DRY core)
 
-Every pair call uses this exact shape (validated):
+Both peers run through the **same** mechanism — only the command line differs (see
+[adapters](#peer-adapters)). Every peer call runs its CLI **inside a zellij pane**
+(see the `zellij` skill), writing to **local `/tmp`** with a done-sentinel, then
+polls `/tmp`. The user watches the panes; the coordinator reads the files.
+
+> **⚠️ Staging must hit the REAL filesystem — the zellij pane is a SEPARATE OS
+> process.** Write `$J.prompt.txt` (+ `$J.schema.json` for Codex) + `$J.sh` with a
+> mechanism that writes REAL files: your **file-write tool** or a **real-shell
+> heredoc** (`cat > $J.sh <<'EOF'`). Confirm with `ls -la $J.sh` from a separate
+> shell BEFORE `zellij run`; if it's missing there, the pane can't see it either.
+> For prompts containing a diff / backticks / `$`, write the prompt with the
+> file-write tool (raw content, no escaping) — never interpolate a diff into a shell
+> string or a REPL template literal.
+
+> **⚠️ Do NOT use `2> >(tee err >&2)` + `--close-on-exit`.** The async `tee` is a
+> separate process that gets **killed when the pane closes**, before it flushes —
+> so `$J.err` is unreliably created (verified failure mode). Use the robust pattern
+> below: run the CLI **backgrounded** with plain `> out 2> err`, `tail -f` the err
+> file for the live view, then `wait` for the real exit code.
 
 ```bash
-# 1. Write the output schema for this context to a temp file (review/diagnosis/plan).
-# Prereq: a writable temp dir (--output-schema needs a FILE path). Capture stderr too.
-SCHEMA="$(mktemp)"; ERR="$(mktemp)"; cat > "$SCHEMA" <<'JSON'
-{ ...the context schema... }
-JSON
-
-# 2. Feed the prompt via stdin; read the clean JSON final message from stdout.
-printf '%s' "$PROMPT" | codex exec \
-  --skip-git-repo-check \
-  -s read-only \
-  -C "<ABSOLUTE repo/worktree path>" \
-  -m "<model from ladder>" \
-  -c model_reasoning_effort="<effort from ladder>" \
-  --output-schema "$SCHEMA" \
-  - 2>"$ERR"
-# stdout = the final message as JSON conforming to the schema.
-# On empty/invalid stdout, read "$ERR" to classify the failure
-# (auth/quota/rate-limit -> Opus fallback; schema/model/sandbox -> report). Never discard it.
+J="/tmp/llmpair-$$"                      # unique per call; STAGE ON /tmp, never on /Volumes
+# 1. Write $J.prompt.txt (REDACTED for third-party peers) with the file-write tool.
+#    For Codex also write $J.schema.json (its --output-schema needs a file).
+# 2. Job script — robust background + tail + wait (no process substitution):
+cat > "$J.sh" <<EOF
+#!/bin/bash
+echo "START \$(date)" > "$J.log"
+echo ">>> <peer> LIVE — progress streams below; final -> $J.out"
+<PEER COMMAND>  > "$J.out" 2> "$J.err" &      # see adapter for <PEER COMMAND>
+P=\$!
+tail -f "$J.err" 2>/dev/null &                # live view in the pane
+T=\$!
+wait \$P; E=\$?
+sleep 1; kill \$T 2>/dev/null
+echo "EXIT=\$E" > "$J.done"
+echo ">>> <peer> done (exit=\$E)."
+EOF
+# 3. Launch in a NEW PANE of the CURRENT zellij session (reuse it; never churn).
+#    Omit --close-on-exit so the pane lingers for reading and the tail isn't killed
+#    mid-flush. Stack onto the shell pane so it doesn't steal focus (zellij skill):
+zellij run --name "<peer>-$$" -- bash "$J.sh"
+#    zellij action stack-panes -- <shell-pane-id> <new-pane-id>
+#    zellij action focus-pane-id <shell-pane-id>
+# 4. POLL the sentinel from SEPARATE short calls (polling never races the command):
+for i in $(seq 1 300); do [ -f "$J.done" ] && break; sleep 2; done
+cat "$J.out"; cat "$J.done"   # read result + EXIT=<code>;  cat "$J.err" to classify a failure
 ```
 
-Flag rationale — these are the whole hardening story:
+In Claude Code's REPL, launch (step 3) and poll (step 4) as **separate** `sh()`
+calls — launch returns immediately, then poll `[ -f "$J.done" ]` until the sentinel
+appears. **Never run the CLI as one long blocking/background `sh()` call** (e.g.
+`sh('codex exec …', 480000)`): an `xhigh`/Pro-High run routinely outlasts the tool
+timeout, the call returns empty, and the result is lost even though the peer
+finished — the exact failure this pane+sentinel pattern prevents. **Last resort if
+zellij is unavailable:** stage on `/tmp` and capture stdout *directly through the
+call's return value* (`out = sh('cat "$J.prompt.txt" | <peer cmd>')`) — never write
+the OUTPUT to a `/Volumes/*` file and read it back later (read-after-write lag).
 
-- **`-s read-only`** — sandboxes the pair's model-generated **shell** commands to read-only, killing the common "Codex edited my files" failure. Scope note: it constrains shell/file-edit tools, **not** a separately-configured write-capable MCP server — for a hard guarantee also restrict tools/config or run with a clean config.
-- **`-C <abs path>`** — pins the working root. Kills "read the wrong worktree." Never omit.
-- **`-m` + `-c model_reasoning_effort=`** — the calibrated tier. (There is no
+**For three-way work, launch BOTH panes (codex + gemini) in parallel**, then poll
+both sentinels. Partial completion is fine: if one peer is still running past a
+sane deadline or errored, proceed with whoever returned (see availability).
+
+**Output verification — never confabulate:** if a peer's output is empty / unusable,
+retry once (fresh call); if it still fails, report honestly and proceed with the
+remaining peer(s) or the fallback — never fabricate an opinion.
+
+---
+
+## Peer adapters
+
+Each adapter is a concrete binding of the shared engine: `<PEER COMMAND>`, output
+mode, read-only enforcement, and availability detection. Selection, redaction,
+consensus, and fallback are shared and unchanged across adapters.
+
+### Codex adapter (`codex exec`)
+
+```bash
+<PEER COMMAND> =
+  cat "$J.prompt.txt" | codex exec \
+    --skip-git-repo-check -s read-only \
+    -C "<ABSOLUTE repo/worktree path>" \
+    -m "<model from Codex ladder>" -c model_reasoning_effort="<effort>" \
+    --output-schema "$J.schema.json" -
+```
+
+- **`-s read-only`** — sandboxes the peer's model-generated shell to read-only,
+  killing "Codex edited my files." Constrains shell/file tools, **not** a separately
+  write-capable MCP server — for a hard guarantee also restrict tools/config.
+- **`-C <abs path>`** — pins the working root. Never omit.
+- **`-m` + `-c model_reasoning_effort=`** — the calibrated tier. (No
   `--reasoning-effort` flag; effort is a config override.)
-- **`--output-schema <file>`** — forces the final answer into structured JSON you
-  can parse. Use the review / diagnosis / plan schema for the context.
-- **`--skip-git-repo-check`** — required so the pair can run on **non-git** content (a docs/skill dir, a worktree). Trade-off: it removes Codex's "not a git repo" early-failure guard, so a typo'd `-C` won't fail fast — double-check the `-C` path is right.
-- **prompt via stdin + `-`** — avoids shell-quoting hell for large diffs/prompts.
-- **`2>"$ERR"` (capture, don't discard)** — Codex puts progress, reasoning, and MCP/hook noise on stderr; the clean final message goes to stdout. Send stderr to a **file**, not `/dev/null`: you need it to classify a failure (auth/quota/rate-limit vs schema/model) for the fallback and honest error reporting. (Do **not** use `--json` — that's the noisy full event stream.)
-- For **free-form** turns (plan reconciliation, consensus follow-ups) drop
-  `--output-schema` and read the clean final message text from stdout.
+- **`--output-schema <file>`** — forces structured JSON you can parse. Use the
+  review / diagnosis / plan schema. (Drop it for free-form turns — plan
+  reconciliation, consensus follow-ups — and read the clean final message.)
+- **`--skip-git-repo-check`** — lets the peer run on non-git content (docs/skill
+  dir, worktree). Trade-off: removes the fail-fast "not a repo" guard, so a typo'd
+  `-C` won't fail fast — double-check it.
+- **prompt via stdin + `-`** — avoids quoting hell for large diffs.
+- Codex puts reasoning/progress on **stderr** (`$J.err`, shown live via `tail`); the
+  clean final JSON is on **stdout** (`$J.out`). Don't use `--json` (noisy event
+  stream).
+- **Availability:** unavailable if `codex` not on PATH; or `$J.done` exit ≠ 0; or
+  `$J.out` empty/invalid after one retry; or `$J.err` matches
+  `rate.?limit|quota|usage limit|429|401|403|not logged in|unauthorized`.
 
-**Prompt shaping (inline — keep it tight):** state the role and boundary ("You are
-reviewing this diff. Do NOT propose edits to files; report findings only."), give
-only the artifact that matters (diff / error / requirements), and name the exact
-output structure. Don't dump conversation history.
+### Gemini adapter (`agy`, the Antigravity CLI)
 
-**Suggested schemas:**
+```bash
+<PEER COMMAND> =
+  cat "$J.prompt.txt" | agy -p - \
+    --model "<model string from Gemini ladder, e.g. Gemini 3.1 Pro (High)>" \
+    --print-timeout 10m
+```
+
+- **`-p -`** — `--print` (non-interactive single shot) reading the prompt from
+  **stdin** (bare `-p` errors "needs an argument"). Like Codex's `-`, this avoids
+  quoting hell.
+- **`--model "Name (Effort)"`** — model **and** effort in one string; effort is
+  baked into the name (`agy models` lists valid ones).
+- **No `--output-schema`.** Coax JSON in the prompt and **parse defensively**
+  (Gemini wraps JSON in conversational filler): (1) strict `JSON.parse` of stdout →
+  (2) first fenced ```json block → (3) first balanced `{...}` → (4) else preserve
+  raw as `unstructured_advice`, mark `schema_valid:false`, never invent fields.
+- **No `-s read-only`; read-only is enforced by discipline:**
+  - Inline the entire artifact in the prompt; the peer needs no filesystem access.
+  - **Do NOT pass `--add-dir`** — it would let Gemini read beyond the redacted
+    prompt, breaking the read-only/privacy guarantee.
+  - **Do NOT pass `--dangerously-skip-permissions`.**
+  - **Inject a hard headless instruction** (see [prompt shaping](#prompt-shaping)):
+    `CRITICAL: headless, non-interactive. Do NOT use any tools or read any files.
+    Output ONLY the requested JSON.` Without this, `agy` may try a tool and prompt
+    for permission on **stdin — which is already at EOF** (consumed by `cat`) → it
+    hangs or crashes. `--print-timeout 10m` bounds the hang.
+- print-mode **stdout is clean** (no progress noise — unlike Codex), which makes the
+  defensive parse easier; `$J.err` is usually empty on success.
+- **Availability:** unavailable if `agy` not on PATH; or timed out (`--print-timeout`
+  hit / no `$J.done` past deadline); or `$J.out` empty/unparseable after one retry;
+  or `$J.err`/`$J.out` matches `rate.?limit|quota|RESOURCE_EXHAUSTED|429|unauthenticated|permission`.
+  **Note:** a rate-limited `agy` may exit **0** with empty/garbage stdout — so check
+  stdout-emptiness AND grep stderr, don't trust the exit code alone.
+
+### Opus fallback adapter (Anthropic — only if BOTH external peers are down)
+
+- Spawn via the Agent tool / Workflow `agent()` with `model: 'opus'` and a
+  **self-contained** prompt — problem statement + the concrete artifact only, **not**
+  your conversation history or conclusions (fresh context = no rubber-stamping).
+- **Same Anthropic trust boundary as the coordinator → send RAW content, no
+  redaction.** Build a fresh raw prompt; do not reuse the redacted peer prompt
+  (that would needlessly degrade Opus's input).
+- **Caveat:** the `model` param exposes only the family (`opus`), resolving to the
+  **current** latest; pinning the exact previous minor may not be selectable. Use
+  `opus` + fresh context anyway, and flag that a real Codex/Gemini pass is worth
+  redoing once limits reset.
+- Same calibration (classifier tier) and read-only/advisor discipline apply.
+
+---
+
+## The contexts
+
+| Context                         | Collaboration pattern              | Peers (default)            |
+|---------------------------------|------------------------------------|----------------------------|
+| Overall plan / impl plan / pre-work | **Parallel-draft → converge**  | **codex + gemini** (3-way) |
+| Implementation review           | **Draft → advisory review → integrate** | classifier (gemini if `big`) |
+| Blocker / error diagnosis       | **Advisory diagnosis**             | classifier, floor `small`  |
+
+### Context A — Planning (parallel-draft → converge)
+
+Do **not** draft a plan and hand it over for critique — that anchors the peers on
+your framing. Instead:
+
+1. **Dispatch both peers' independent drafts in parallel panes** with the **same
+   source material** (ticket, requirements, relevant code — **redacted**) but **not
+   your draft**. Use the plan schema (Codex) / plan JSON shape inline (Gemini).
+2. **While they run, draft your own plan** independently.
+3. **Collect all three, diff the ideas** — agreements, real disagreements, anything
+   one side caught that the others missed.
+4. **Iterate to consensus** ([loop](#the-consensus-loop)) on real disagreements only.
+5. Present the converged plan + a "what each peer caught / what we rejected" note.
+
+### Context B — Implementation review (draft → advisory review → integrate)
+
+Triggered when a **work item reaches a complete state**.
+
+1. Build the signal pack and **classify**. If `skip`, say so and move on.
+2. Dispatch the selected peer(s) **read-only** at the classified tier over the work
+   item's **redacted** diff, using the review schema/shape. Findings by severity,
+   file:line, explicit "no findings → say so."
+3. **Integrate** correct findings (re-expand placeholders first); push back on wrong
+   ones. Iterate to consensus; present findings, then "what we fixed / rejected."
+
+### Context C — Blocker / error diagnosis (advisory diagnosis)
+
+Triggered only by the reactive threshold (2+ failed fixes **or** cascading errors).
+
+1. Classify (floor `small`); wide blast radius → `big` (pulls in Gemini).
+2. Dispatch peer(s) **read-only** with the **redacted** error, what you've tried,
+   and the relevant code, using the diagnosis schema/shape. Ask for ranked
+   root-cause hypotheses + a concrete next probe — not a blind patch.
+3. Apply the fix yourself; if it fails, escalate a tier and re-pair.
+
+---
+
+## Prompt shaping
+
+Keep it tight: state the role and boundary ("You are reviewing this diff read-only.
+Report findings only; do NOT propose file edits."), give only the artifact that
+matters (redacted diff / error / requirements), and name the exact output shape.
+Don't dump conversation history.
+
+**Gemini headless guard (every Gemini prompt).** Prepend: `CRITICAL: you are running
+headless and non-interactive. Do NOT use any tools, do NOT attempt to read files —
+everything you need is inline. Output ONLY the requested JSON, no prose, no code
+fences.` (Codex's `-s read-only` + `--output-schema` make this unnecessary for it.)
+
+**Ponytail lens (include in every plan + review prompt).** Tell the peer to apply a
+simplicity bias *alongside* correctness: prefer the laziest solution that holds
+(stdlib → native platform feature → already-installed dep → one line → minimum
+code), and to raise as findings any speculative abstraction, a new dependency for
+what a few lines do, config/indirection for values that never change, scaffolding
+"for later," or a diff that could be smaller or deleted outright. Hard limit: never
+simplify away validation at trust boundaries, error handling, security, or anything
+the user explicitly asked for. (Mirrors the `ponytail` skill.)
+
+**Suggested schemas** (Codex: `--output-schema`; Gemini: paste the shape into the
+prompt and parse defensively):
 
 ```jsonc
 // review
@@ -251,83 +511,93 @@ output structure. Don't dump conversation history.
   "required":["goal","steps","filesTouched","risks","openQuestions"] }
 ```
 
-**Output verification — never confabulate:**
-
-- If stdout is empty / not valid JSON / a failure, **retry once** (fresh call).
-- If it still fails, **report the failure honestly and stop** — do **not** fabricate
-  the pair's opinion or pass your own analysis off as the pair's.
-- If the pair was never successfully invoked, do not generate a substitute — try
-  the [fallback](#fallback--when-codex-is-unavailable) or report.
-
----
-
-## Fallback — when Codex is unavailable
-
-If `codex exec` fails with a **rate-limit / quota / auth** error (or `codex` is
-not on PATH), fall back to the **previous-generation Opus** as the pair, with
-**fresh context**:
-
-- Spawn via the Agent tool / Workflow `agent()` with `model: 'opus'` and a
-  **self-contained** prompt — only the problem statement + the concrete artifact
-  (diff, files, error). **Not** your conversation history or conclusions.
-- **Why both matter:** *model diversity* (a genuinely different model catches what
-  you're blind to — reusing your own model shares your biases) and *fresh context*
-  (a reviewer that shares your reasoning rubber-stamps it).
-- **Tooling caveat:** the subagent `model` param exposes only the family (`opus`),
-  which resolves to the **current** latest — pinning the exact previous minor
-  (e.g. 4.7 when 4.8 is latest) may not be selectable. If it can't be pinned, use
-  `opus` + fresh context anyway, and flag that a real Codex pass is still worth
-  doing once limits reset.
-- The same calibration (classifier tier) and read-only/advisor discipline apply —
-  the fallback only swaps the backend.
-
 ---
 
 ## The consensus loop
 
-Pairing is **iteration to consensus**, not a single pass:
+Pairing is **iteration to consensus**, not a single pass. With two peers, the
+coordinator is the **executive synthesizer** — not a relay.
 
-1. Integrate the pair's correct points; push back, with reasoning, where it's wrong.
-2. If material disagreements remain, send a **targeted** round — explain your
-   position, ask for a specific response.
-3. **Stop** when the pair's last round is "no further concerns," or remaining
-   disagreements are explicit, recorded trade-offs for the user to arbitrate.
-4. **Escalate a tier** if a review/blocker round won't converge after ~2 passes or
-   the work proves bigger than first classified — re-pair from the higher rung.
-5. Present the converged result + a short **"what the pair caught / what we
-   rejected and why"** note.
+1. Collect each peer's structured output. Form your own view. Re-expand placeholders
+   before reasoning about findings.
+2. Build a quick agreement map: where all agree (high confidence), where a majority
+   agrees, and lone-wolf findings (judge on merit).
+3. Integrate correct points; push back, with reasoning, on wrong ones. **Don't
+   launder one peer's unsupported claim into "consensus."**
+4. **Second round only if a material disagreement remains** — send a **compact
+   disagreement brief** (claim, evidence, why contested, the specific question) to
+   the relevant peer(s) only. Do **not** replay full transcripts, and do **not**
+   pipe peers' full outputs to each other (token + leakage + ping-pong cost).
+5. **Hard cap: 2 peer rounds.** After round 2, the coordinator **decides
+   unilaterally** and terminates the loop — record unresolved trade-offs for the
+   user to arbitrate. Escalate a tier and re-pair only if the work proved bigger
+   than first classified.
+6. Present the converged result + a **"what Codex caught / what Gemini caught / what
+   the coordinator accepted or rejected and why / residual risk"** note.
 
-Don't accept the pair blindly; don't dismiss it reflexively. The reconciled
-position is the deliverable.
+Don't accept a peer blindly; don't dismiss it reflexively. The reconciled position
+is the deliverable.
+
+---
+
+## Availability & fallback state machine
+
+```text
+intended := peers from the fan-out matrix for this verdict
+for each peer in intended: attempt once (bounded); classify result
+  -> usable result        : keep
+  -> unavailable           : drop (rate-limit / auth / timeout / not-on-PATH / empty)
+  -> available but garbage : retry once; still garbage -> treat as no usable result
+
+if any third-party peer produced a usable result:
+    proceed with those + the coordinator        # NO Opus, even if the other peer died
+elif single-peer tier and primary(codex) down but gemini up:
+    substitute gemini at the tier-equivalent rung   # substitute, not a 2nd peer
+elif BOTH codex AND gemini unavailable:
+    spawn ONE previous-gen Opus agent (raw content, fresh context) as the sole peer
+else:
+    report that no peer was reachable; do not confabulate
+```
+
+**"Unavailable" is scoped to the current request** (one bounded attempt) — a
+transient Gemini rate-limit must not poison later turns. Distinguish *unavailable*
+(rate-limit/auth/timeout → fall back) from *available-but-malformed* (peer answered,
+output unusable → retry, but do **not** jump to Opus if the other peer succeeded).
+Per-CLI detection patterns live in the [adapters](#peer-adapters).
 
 ---
 
 ## First-run setup (one-time, per machine)
 
-`llm-pair` triggers reliably only if the host CLAUDE.md tells the agent to use it,
-and `npx skills` does not display post-install messages. So on first invocation:
+`llm-pair` triggers reliably only if the host CLAUDE.md tells the agent to use it.
+On first invocation:
 
-- Check whether the user's CLAUDE.md (global or project) already contains an
-  `llm-pair` pairing rule.
-- If not, **offer** to add the wiring block from the README's "Setup" section (the
-  proactive-trigger + deferral rules). **Do not edit CLAUDE.md without consent.**
-- Confirm prerequisites: the `codex` CLI on PATH (e.g. `brew install codex`) and
-  authenticated; an Opus-capable agent for the fallback.
+- Check whether the user's CLAUDE.md (global or project) contains an `llm-pair`
+  pairing rule; if not, **offer** to add the wiring block from the README "Setup"
+  section. **Do not edit CLAUDE.md without consent.**
+- Confirm prerequisites:
+  - `codex` CLI on PATH (`brew install codex`) and authenticated.
+  - `agy` CLI (Antigravity) on PATH and authenticated (`agy models` should list
+    models). Gemini is **optional** — if `agy` is absent, the skill runs Codex-only
+    (that's not "both down", so no Opus unless Codex is also down).
+  - An Opus-capable agent for the both-down fallback.
 
 ---
 
-## Portability — swapping the pair backend
+## Portability — swapping backends
 
 Designed to be open-sourced (`iotashan/llm-pair`). Bindings:
 
 - **Classifier** — Claude Code's REPL `haiku()`. Any fast model with structured
   output works; keep the schema, swap the call.
-- **Pair backend** — the `codex` CLI (`codex exec`). No Claude Code plugin
-  required — only the standalone `codex` binary on PATH. To add another backend,
-  replace the [invocation contract](#hardened-invocation--the-codex-exec-contract)
-  and the model IDs in [CONFIG](#config--the-tier-ladder-edit-this-block-to-tune);
-  contexts, classifier, fallback, and consensus loop are unchanged.
+- **Peer backends** — the `codex` CLI and the `agy` CLI, each a concrete
+  [adapter](#peer-adapters) over the [shared dispatch engine](#the-shared-dispatch-engine-dry-core).
+  To add/replace a backend, write a new adapter (command template, output mode,
+  read-only enforcement, availability detection) + its CONFIG ladder; selection,
+  redaction, consensus, and fallback are unchanged.
 - **Fallback** — any Opus-capable agent (Claude Code's Agent/Workflow tools).
+- **Fan-out policy** — the [fan-out matrix](#fan-out-matrix--who-gets-invoked-default-complex-only)
+  is the one knob to change which/when peers are invoked.
 
 Local install wiring (skill symlinks, CLAUDE.md edits) is **not** part of the
 shippable skill — see the README "Setup" section.
