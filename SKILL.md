@@ -238,7 +238,7 @@ const SCHEMA = {
     confidence: { type: 'string', enum: ['high','med','low'] },
     riskFlags:  { type: 'array', items: { type: 'string' } }
   },
-  required: ['reasoning','verdict','riskFlags']
+  required: ['reasoning','verdict','confidence','riskFlags']
 }
 ```
 
@@ -513,11 +513,12 @@ TASK: <Review this diff for correctness, then reuse/simplification. | Draft your
   plan; do not assume an approach. | Give ranked root-cause hypotheses + one concrete
   next probe; do not patch blind.>
 LENS (plan+review only): Prefer the laziest solution that holds (stdlib → native
-  feature → installed dep → one line → minimum code); raise as findings
-  (category:simplification) any speculative abstraction, needless dep, indirection for
-  constants, scaffolding-for-later, or a diff that could shrink/delete. MUST NOT
-  simplify away trust-boundary validation, error handling, security, or
-  explicitly-requested behavior.
+  feature → installed dep → one line → minimum code). REVIEW: raise over-engineering as
+  findings with category:simplification (speculative abstraction, needless dep,
+  indirection for constants, scaffolding-for-later, a diff that could shrink/delete).
+  PLANNING: prefer the smallest plan that works and record over-engineering you rejected
+  under risks/openQuestions (the plan schema has no findings[]). MUST NOT simplify away
+  trust-boundary validation, error handling, security, or explicitly-requested behavior.
 CONTEXT: <repo / language / what the change or plan is meant to do — 1–2 lines>
 ARTIFACT (redacted):
 <diff | error+attempts+code | requirements>
@@ -538,9 +539,11 @@ OUTPUT CONTRACT: Return ONLY JSON matching the task schema below.
   next probe — not a blind patch.
 
 **Tier nudge (the ONLY richness scaling — progressive disclosure):** at `big`/planning
-only, append ONE sentence to TASK: *"Before returning, drop any finding you cannot tie
-to a specific line and downgrade anything that's a preference rather than a defect;
-reason internally before emitting the JSON."* Nothing more — no examples, no
+only, append ONE sentence to TASK, matched to the mode — **review/diagnosis:** *"Before
+returning, drop any finding you cannot tie to a specific line and downgrade anything
+that's a preference rather than a defect; reason internally before emitting the JSON."*
+**planning:** *"Before returning, drop any step you're not confident in and reason
+internally before emitting the JSON."* Nothing more — no examples, no
 multi-stage verify loop. Codex's `-s read-only` + `--output-schema` make the
 Gemini-only MUST line redundant for Codex; include it for Gemini only.
 
@@ -568,8 +571,8 @@ plus the defensive parser.
       "required":["severity","category","file","line","issue","suggestion","confidence"]}},
     "summary":{"type":"string"},"residualRisk":{"type":"string"},
     "insufficient_context":{"type":"array","items":{"type":"string"}}},
-  "required":["findings","summary","residualRisk"] }
-//   line = "N" or "N-M", no prose. insufficient_context is optional.
+  "required":["findings","summary","residualRisk","insufficient_context"] }
+//   line = "N" or "N-M", no prose. insufficient_context REQUIRED (emit [] if none).
 
 // diagnosis
 { "type":"object","additionalProperties":false,
@@ -581,8 +584,8 @@ plus the defensive parser.
       "required":["cause","likelihood","evidence"]}},
     "nextProbe":{"type":"string"},"summary":{"type":"string"},
     "insufficient_context":{"type":"array","items":{"type":"string"}}},
-  "required":["hypotheses","nextProbe","summary"] }
-//   likelihood stays as the confidence signal. insufficient_context is optional.
+  "required":["hypotheses","nextProbe","summary","insufficient_context"] }
+//   likelihood stays as the confidence signal. insufficient_context REQUIRED (emit []).
 
 // plan
 { "type":"object","additionalProperties":false,
@@ -596,13 +599,15 @@ plus the defensive parser.
     "risks":{"type":"array","items":{"type":"string"}},
     "openQuestions":{"type":"array","items":{"type":"string"}},
     "insufficient_context":{"type":"array","items":{"type":"string"}}},
-  "required":["goal","steps","filesTouched","risks","openQuestions"] }
+  "required":["goal","steps","filesTouched","risks","openQuestions","insufficient_context"] }
 ```
 
-**Merge note:** Gemini isn't schema-enforced — when reconciling, treat a missing
-`confidence` as *unknown* (not `low`/0). `insufficient_context` is the in-band
-grounding hatch: a peer says "I can't see this" instead of degrading to
-`unstructured_advice`.
+**Merge note:** every property is in `required` on purpose — OpenAI's `--output-schema`
+strict mode rejects a schema (with `additionalProperties:false`) unless `required` lists
+*every* key, so `insufficient_context` is always emitted (`[]` when the peer saw enough).
+Gemini isn't schema-enforced — when reconciling, treat a missing `confidence`/field as
+*unknown* (not `low`/0). `insufficient_context` is the in-band grounding hatch: a peer
+says "I can't see this" instead of degrading to `unstructured_advice`.
 
 ---
 
@@ -621,8 +626,10 @@ coordinator is the **executive synthesizer** — not a relay.
    disagreement brief** (claim, evidence, why contested, the specific
    yes/no-answerable question) to the relevant peer(s) only. **Redact any
    freshly-quoted evidence first** — this ad-hoc mini-prompt bypasses the
-   assembly-time redaction gate. The peer replies in the SAME finding/hypothesis shape
-   plus `position:hold|change` and an updated `confidence`, so a changed position +
+   assembly-time redaction gate. Run round 2 **free-form (no `--output-schema`)** — the peer
+   replies in the same finding/hypothesis shape **plus** `position:hold|change` and an
+   updated `confidence` (extra fields a strict `additionalProperties:false` schema would
+   reject, which is why this round drops schema enforcement), so a changed position +
    confidence delta are mechanically detectable. Do **not** replay full transcripts,
    and do **not** pipe peers' full outputs to each other (token + leakage + ping-pong
    cost).
