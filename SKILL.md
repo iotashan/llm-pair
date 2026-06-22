@@ -718,17 +718,12 @@ Designed to be open-sourced (`iotashan/llm-pair`). Bindings:
   the tier nudge) is answerable from the vendored text with zero extra tool calls; a
   per-turn skill-load would tax the path that fires on EVERY pairing and defeat the
   cost-calibration mandate, and would break self-containment (a downstream user of
-  `iotashan/llm-pair` with no prompt skills installed loses nothing).
-- **Runtime prompt help (opt-in, OFF the hot path)** — for a **novel or unusually
-  high-stakes** prompt the skeleton doesn't fit, OR when the user asks ("use prompt
-  help" / "optimize the prompt"), the coordinator MAY consult the installed prompt
-  skills — `prompt-engineering-patterns`, `prompt-engineer`, `enhance-prompt`,
-  `llm-prompt-optimizer` — to refine the prompt **before** dispatch. Read-only guidance
-  only: use their patterns/templates to shape text. **Never** run their code
-  (`optimize-prompt.py` or any script) inside the read-only / redaction /
-  no-confabulate boundary — `prompt-engineering-patterns` is `source:community /
-  risk:unknown` — and never put this on the default per-turn path. This is also how a
-  maintainer re-tunes the vendored blocks: consult offline, paste improved text back in.
+  `iotashan/llm-pair` with no prompt skills installed loses nothing). To re-tune the vendored blocks, a maintainer consults the
+  prompt skills (`prompt-engineer`, `enhance-prompt`, `llm-prompt-optimizer`,
+  `prompt-engineering-patterns`) **offline** and pastes improved text back in — never a
+  runtime call-out, and never running their code inside the read-only / redaction /
+  no-confabulate boundary (`prompt-engineering-patterns` is `source:community /
+  risk:unknown`).
 
 Local install wiring (skill symlinks, CLAUDE.md edits) is **not** part of the
 shippable skill — see the README "Setup" section.
