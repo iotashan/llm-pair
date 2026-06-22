@@ -233,11 +233,12 @@ model+effort and peer set via [CONFIG](#config--tier-ladders--fan-out-edit-this-
 const SCHEMA = {
   type: 'object',
   properties: {
-    verdict:   { type: 'string', enum: ['skip','trivial','small','normal','big'] },
-    riskFlags: { type: 'array', items: { type: 'string' } },
-    rationale: { type: 'string' }
+    reasoning:  { type: 'string' },   // FIRST: brief CoT that DRIVES the verdict
+    verdict:    { type: 'string', enum: ['skip','trivial','small','normal','big'] },
+    confidence: { type: 'string', enum: ['high','med','low'] },
+    riskFlags:  { type: 'array', items: { type: 'string' } }
   },
-  required: ['verdict','riskFlags','rationale']
+  required: ['reasoning','verdict','riskFlags']
 }
 ```
 
@@ -247,9 +248,10 @@ visible risk flags. **Classify on redacted signals if the summary contains
 sensitive data** (the classifier is local Haiku, so raw is acceptable, but stay
 consistent).
 
-**Rules:** any risk flag → `skip`/`trivial` off the table; blocker → floor `small`;
-**explicit user override wins** ("pair on max", `--tier big`, "three-way", a named
-model) → skip the classifier. Surface the verdict + chosen peers in one line before
+**Rules:** any risk flag → `skip`/`trivial` off the table; **low `confidence` biases
+the verdict UP one rung** (the conservative default on a borderline `normal`/`big`);
+blocker → floor `small`; **explicit user override wins** ("pair on max", `--tier big`,
+"three-way", a named model) → skip the classifier. Surface the verdict + chosen peers in one line before
 dispatching ("Classified review as `big` → codex gpt-5.5@xhigh + gemini Pro High").
 
 ---
@@ -320,6 +322,24 @@ zellij is unavailable:** run the adapter's `<PEER COMMAND>` directly and capture
 stdout *through the call's return value* (`out = sh(<PEER COMMAND>)` — it already
 includes the `cat "$J.prompt.txt" | …` stdin plumbing) — never write
 the OUTPUT to a `/Volumes/*` file and read it back later (read-after-write lag).
+
+**Reliability notes (learned the hard way):**
+
+- **`&` only survives inside a zellij pane, never from a plain `sh()` call.** The
+  REPL tool kills its child process tree when the call returns, so a `nohup … &` /
+  `disown` job started from `sh()` dies instantly. zellij `run` panes run under the
+  long-lived zellij *server*, so they persist — that's why detach goes through a pane,
+  not `nohup`.
+- **Reads of `$J.*` can transiently report "no such file"** for a second or two right
+  after creation (filesystem/tool lag). Before concluding a peer produced nothing,
+  **re-stat after a 1–2 s sleep** (or read once more) — a single failed read is NOT
+  "peer unavailable." Pairs with the preflight + pre-touch above.
+- **Never clean up with a glob that can match a still-needed file.** `rm -f
+  /tmp/llmpair-*` will delete the runner/prompt you just staged and leave the pane
+  running an empty script (silent empty-output failure). Clean by explicit paths, or
+  `rm -rf` a per-peer `mktemp -d` directory.
+- **Close finished peer panes** (`zellij action close-pane --pane-id <id>`) so they
+  don't accumulate across pairings.
 
 **For three-way work, launch BOTH panes (codex + gemini) in parallel**, then poll
 both sentinels. Partial completion is fine: if one peer is still running past a
@@ -440,7 +460,9 @@ your framing. Instead:
 
 1. **Dispatch both peers' independent drafts in parallel panes** with the **same
    source material** (ticket, requirements, relevant code — **redacted**) but **not
-   your draft**. Use the plan schema (Codex) / plan JSON shape inline (Gemini).
+   your draft**. Build BOTH prompts from the skeleton with the **planning** role line
+   and the **plan** contract — `--output-schema` for Codex, the SAME schema pasted
+   inline for Gemini.
 2. **While they run, draft your own plan** independently.
 3. **Collect all three, diff the ideas** — agreements, real disagreements, anything
    one side caught that the others missed.
@@ -453,8 +475,8 @@ Triggered when a **work item reaches a complete state**.
 
 1. Build the signal pack and **classify**. If `skip`, say so and move on.
 2. Dispatch the selected peer(s) **read-only** at the classified tier over the work
-   item's **redacted** diff, using the review schema/shape. Findings by severity,
-   file:line, explicit "no findings → say so."
+   item's **redacted** diff, using the **review** role line + **review** contract
+   (file:line in the contract's "N" or "N-M" format). Explicit "no findings → say so."
 3. **Integrate** correct findings (re-expand placeholders first); push back on wrong
    ones. Iterate to consensus; present findings, then "what we fixed / rejected."
 
@@ -464,35 +486,74 @@ Triggered only by the reactive threshold (2+ failed fixes **or** cascading error
 
 1. Classify (floor `small`); wide blast radius → `big` (pulls in Gemini).
 2. Dispatch peer(s) **read-only** with the **redacted** error, what you've tried,
-   and the relevant code, using the diagnosis schema/shape. Ask for ranked
-   root-cause hypotheses + a concrete next probe — not a blind patch.
+   and the relevant code, using the **diagnosis** role line + **diagnosis** contract.
+   Ask for ranked root-cause hypotheses + a concrete next probe — not a blind patch.
 3. Apply the fix yourself; if it fails, escalate a tier and re-pair.
 
 ---
 
-## Prompt shaping
+## Prompt shaping — ONE skeleton, filled per peer
 
-Keep it tight: state the role and boundary ("You are reviewing this diff read-only.
-Report findings only; do NOT propose file edits."), give only the artifact that
-matters (redacted diff / error / requirements), and name the exact output shape.
-Don't dump conversation history.
+Assemble EVERY peer prompt from these labeled slots, in this order (the
+prompt-engineering *instruction hierarchy*). Same skeleton for both peers and all
+three contexts so outputs stay diffable; only the bracketed bits and the Gemini-only
+line differ. Assemble **after redaction**. Keep each slot to one line; the artifact
+is the only large block.
 
-**Gemini headless guard (every Gemini prompt).** Prepend: `CRITICAL: you are running
-headless and non-interactive. Do NOT use any tools, do NOT attempt to read files —
-everything you need is inline. Output ONLY the requested JSON, no prose, no code
-fences.` (Codex's `-s read-only` + `--output-schema` make this unnecessary for it.)
+```text
+ROLE: <pick by context — verbatim lines below>
+MUST: Return findings/analysis ONLY; do NOT propose to run, edit, or execute
+  anything. Output exactly one JSON object matching the contract — nothing before or
+  after. Base every claim ONLY on the artifact below; do not assume code / imports /
+  behavior you cannot see — if you lack context, list it under "insufficient_context"
+  instead of guessing.
+[Gemini only] MUST: You are headless and non-interactive. Use NO tools and read NO
+  files — everything is inline. No prose outside the JSON object.
+TASK: <Review this diff for correctness, then reuse/simplification. | Draft your OWN
+  plan; do not assume an approach. | Give ranked root-cause hypotheses + one concrete
+  next probe; do not patch blind.>
+LENS (plan+review only): Prefer the laziest solution that holds (stdlib → native
+  feature → installed dep → one line → minimum code); raise as findings
+  (category:simplification) any speculative abstraction, needless dep, indirection for
+  constants, scaffolding-for-later, or a diff that could shrink/delete. MUST NOT
+  simplify away trust-boundary validation, error handling, security, or
+  explicitly-requested behavior.
+CONTEXT: <repo / language / what the change or plan is meant to do — 1–2 lines>
+ARTIFACT (redacted):
+<diff | error+attempts+code | requirements>
+OUTPUT CONTRACT: Return ONLY JSON matching the task schema below.
+```
 
-**Ponytail lens (include in every plan + review prompt).** Tell the peer to apply a
-simplicity bias *alongside* correctness: prefer the laziest solution that holds
-(stdlib → native platform feature → already-installed dep → one line → minimum
-code), and to raise as findings any speculative abstraction, a new dependency for
-what a few lines do, config/indirection for values that never change, scaffolding
-"for later," or a diff that could be smaller or deleted outright. Hard limit: never
-simplify away validation at trust boundaries, error handling, security, or anything
-the user explicitly asked for. (Mirrors the `ponytail` skill.)
+**Role lines (verbatim — pick by context):**
 
-**Suggested schemas** (Codex: `--output-schema`; Gemini: paste the shape into the
-prompt and parse defensively):
+- **review:** You are an adversarial senior code reviewer acting as a read-only
+  advisor. Find real correctness defects first, then reuse/simplification wins.
+  Findings only; you never edit files.
+- **planning:** You are an independent senior engineer drafting your OWN
+  implementation plan from the requirements below. You have NOT seen any other plan —
+  do not assume an approach; propose what you think is best, then name the risks you'd
+  want a reviewer to challenge.
+- **diagnosis:** You are a systematic debugger acting as a read-only advisor. From the
+  error and what's been tried, produce ranked root-cause hypotheses and ONE concrete
+  next probe — not a blind patch.
+
+**Tier nudge (the ONLY richness scaling — progressive disclosure):** at `big`/planning
+only, append ONE sentence to TASK: *"Before returning, drop any finding you cannot tie
+to a specific line and downgrade anything that's a preference rather than a defect;
+reason internally before emitting the JSON."* Nothing more — no examples, no
+multi-stage verify loop. Codex's `-s read-only` + `--output-schema` make the
+Gemini-only MUST line redundant for Codex; include it for Gemini only.
+
+The skeleton, role lines, LENS, and tier nudge are **vendored** from the
+`prompt-engineering-patterns` skill — see
+[Portability](#portability--swapping-backends); don't shell out to it on the per-turn
+hot path. (LENS mirrors the `ponytail` skill.)
+
+**Output contract** (Codex: `--output-schema`; Gemini: paste the shape, parse
+defensively, treat a missing field as *unknown*). Reasoning lives in the model's
+reasoning channel (Codex stderr / Gemini's internal pass from the tier nudge), **not**
+a JSON field — a free-text reasoning field is brittle under `additionalProperties:false`
+plus the defensive parser.
 
 ```jsonc
 // review
@@ -500,11 +561,15 @@ prompt and parse defensively):
   "properties":{
     "findings":{"type":"array","items":{"type":"object","additionalProperties":false,
       "properties":{"severity":{"type":"string","enum":["critical","high","medium","low","nit"]},
+        "category":{"type":"string","enum":["correctness","simplification","efficiency"]},
         "file":{"type":"string"},"line":{"type":"string"},
-        "issue":{"type":"string"},"suggestion":{"type":"string"}},
-      "required":["severity","file","line","issue","suggestion"]}},
-    "summary":{"type":"string"},"residualRisk":{"type":"string"}},
+        "issue":{"type":"string"},"suggestion":{"type":"string"},
+        "confidence":{"type":"string","enum":["high","med","low"]}},
+      "required":["severity","category","file","line","issue","suggestion","confidence"]}},
+    "summary":{"type":"string"},"residualRisk":{"type":"string"},
+    "insufficient_context":{"type":"array","items":{"type":"string"}}},
   "required":["findings","summary","residualRisk"] }
+//   line = "N" or "N-M", no prose. insufficient_context is optional.
 
 // diagnosis
 { "type":"object","additionalProperties":false,
@@ -514,18 +579,30 @@ prompt and parse defensively):
         "likelihood":{"type":"string","enum":["high","medium","low"]},
         "evidence":{"type":"string"}},
       "required":["cause","likelihood","evidence"]}},
-    "nextProbe":{"type":"string"},"summary":{"type":"string"}},
+    "nextProbe":{"type":"string"},"summary":{"type":"string"},
+    "insufficient_context":{"type":"array","items":{"type":"string"}}},
   "required":["hypotheses","nextProbe","summary"] }
+//   likelihood stays as the confidence signal. insufficient_context is optional.
 
 // plan
 { "type":"object","additionalProperties":false,
   "properties":{
-    "goal":{"type":"string"},"steps":{"type":"array","items":{"type":"string"}},
+    "goal":{"type":"string"},
+    "steps":{"type":"array","items":{"type":"object","additionalProperties":false,
+      "properties":{"n":{"type":"integer"},"action":{"type":"string"},
+        "confidence":{"type":"string","enum":["high","med","low"]}},
+      "required":["n","action","confidence"]}},
     "filesTouched":{"type":"array","items":{"type":"string"}},
     "risks":{"type":"array","items":{"type":"string"}},
-    "openQuestions":{"type":"array","items":{"type":"string"}}},
+    "openQuestions":{"type":"array","items":{"type":"string"}},
+    "insufficient_context":{"type":"array","items":{"type":"string"}}},
   "required":["goal","steps","filesTouched","risks","openQuestions"] }
 ```
+
+**Merge note:** Gemini isn't schema-enforced — when reconciling, treat a missing
+`confidence` as *unknown* (not `low`/0). `insufficient_context` is the in-band
+grounding hatch: a peer says "I can't see this" instead of degrading to
+`unstructured_advice`.
 
 ---
 
@@ -541,9 +618,14 @@ coordinator is the **executive synthesizer** — not a relay.
 3. Integrate correct points; push back, with reasoning, on wrong ones. **Don't
    launder one peer's unsupported claim into "consensus."**
 4. **Second round only if a material disagreement remains** — send a **compact
-   disagreement brief** (claim, evidence, why contested, the specific question) to
-   the relevant peer(s) only. Do **not** replay full transcripts, and do **not**
-   pipe peers' full outputs to each other (token + leakage + ping-pong cost).
+   disagreement brief** (claim, evidence, why contested, the specific
+   yes/no-answerable question) to the relevant peer(s) only. **Redact any
+   freshly-quoted evidence first** — this ad-hoc mini-prompt bypasses the
+   assembly-time redaction gate. The peer replies in the SAME finding/hypothesis shape
+   plus `position:hold|change` and an updated `confidence`, so a changed position +
+   confidence delta are mechanically detectable. Do **not** replay full transcripts,
+   and do **not** pipe peers' full outputs to each other (token + leakage + ping-pong
+   cost).
 5. **Hard cap: 2 peer rounds.** After round 2, the coordinator **decides
    unilaterally** and terminates the loop — record unresolved trade-offs for the
    user to arbitrate. Escalate a tier and re-pair only if the work proved bigger
@@ -617,6 +699,29 @@ Designed to be open-sourced (`iotashan/llm-pair`). Bindings:
 - **Fallback** — any Opus-capable agent (Claude Code's Agent/Workflow tools).
 - **Fan-out policy** — the [fan-out matrix](#fan-out-matrix--who-gets-invoked-default-complex-only)
   is the one knob to change which/when peers are invoked.
+
+- **Prompt templates** — the peer-prompt skeleton, the verbatim role lines, the task
+  output contracts, the LENS block, and the tier nudge in
+  [Prompt shaping](#prompt-shaping--one-skeleton-filled-per-peer) are **vendored** from
+  the `prompt-engineering-patterns` skill (its instruction-hierarchy, task-schema,
+  grounding, and progressive-disclosure patterns), baked in as static text. On the
+  per-turn hot path the coordinator reads ONLY this file — it does **not** Skill-invoke
+  `prompt-engineering-patterns`, read its `references/*.md`, or run its
+  `optimize-prompt.py`. Every lookup (which role line, which contract, whether to add
+  the tier nudge) is answerable from the vendored text with zero extra tool calls; a
+  per-turn skill-load would tax the path that fires on EVERY pairing and defeat the
+  cost-calibration mandate, and would break self-containment (a downstream user of
+  `iotashan/llm-pair` with no prompt skills installed loses nothing).
+- **Runtime prompt help (opt-in, OFF the hot path)** — for a **novel or unusually
+  high-stakes** prompt the skeleton doesn't fit, OR when the user asks ("use prompt
+  help" / "optimize the prompt"), the coordinator MAY consult the installed prompt
+  skills — `prompt-engineering-patterns`, `prompt-engineer`, `enhance-prompt`,
+  `llm-prompt-optimizer` — to refine the prompt **before** dispatch. Read-only guidance
+  only: use their patterns/templates to shape text. **Never** run their code
+  (`optimize-prompt.py` or any script) inside the read-only / redaction /
+  no-confabulate boundary — `prompt-engineering-patterns` is `source:community /
+  risk:unknown` — and never put this on the default per-turn path. This is also how a
+  maintainer re-tunes the vendored blocks: consult offline, paste improved text back in.
 
 Local install wiring (skill symlinks, CLAUDE.md edits) is **not** part of the
 shippable skill — see the README "Setup" section.

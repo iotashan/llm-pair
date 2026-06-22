@@ -152,6 +152,15 @@ nothing else changes.
   availability detection) over a shared zellij-pane dispatch engine.
 - **Fallback** — any Opus-capable agent, used only when both external peers are
   unavailable.
+- **Prompt templates** — the peer-prompt skeleton, role lines, task output contracts,
+  the simplicity LENS, and the tier nudge are **vendored** from the
+  `prompt-engineering-patterns` skill (instruction-hierarchy, task-schema, grounding,
+  progressive-disclosure patterns), baked into `SKILL.md` as static text — the hot
+  path loads no prompt skill and runs no external code, so the skill stays
+  self-contained. An **opt-in, off-the-hot-path** hook lets the coordinator consult
+  installed prompt skills (`prompt-engineering-patterns`, `prompt-engineer`,
+  `enhance-prompt`, `llm-prompt-optimizer`) to refine a novel/high-stakes prompt
+  before dispatch; their code is never run inside the read-only/redaction boundary.
 
 To add another peer backend, write a new adapter + its CONFIG ladder; the contexts,
 classifier, redaction, consensus, and fallback are unchanged.
