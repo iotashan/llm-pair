@@ -1,5 +1,6 @@
 ---
 name: llm-pair
+version: 1.1.0
 description: >-
   Use for ALL pairing with peer LLMs. Triggers: the user says "pair with codex",
   "pair with gemini", "pair with the LLM", "llm-pair", "three-way", or
@@ -33,7 +34,7 @@ now a mild misnomer — complex work is a three-way panel — but the name stays
 
 ## The problems this solves
 
-1. **Cost calibration.** Running at max (top model + `xhigh`) on everything gives a
+1. **Cost calibration.** Running everything at the ceiling (top model + `max`) gives a
    one-line fix the same super-review as a risky migration; the usage window
    evaporates. This skill picks a **(model, effort) tier** sized to the task, per
    backend, and only fans out to the second peer when the stakes justify it.
@@ -79,11 +80,19 @@ fall back one rung toward the stronger model and note it.
 | `skip`      | — (do not call peers)  | —        | trivial **and** zero risk signals — not worth pairing       |
 | `trivial`   | `gpt-5.3-codex-spark`  | `low`    | rename, comment, one-line tweak, isolated copy/config       |
 | `small`     | `gpt-5.4-mini`         | `low`    | small, well-contained change, low blast radius              |
-| `normal`    | `gpt-5.5`              | `medium` | ordinary feature/fix, moderate scope                        |
-| `big`       | `gpt-5.5`              | `xhigh`  | large, cross-cutting, or high breakage risk                 |
+| `normal`    | `gpt-5.6-terra`        | `medium` | ordinary feature/fix, moderate scope                        |
+| `big`       | `gpt-5.6-sol`          | `max`    | large, cross-cutting, or high breakage risk                 |
 
 **Codex effort floor is `low`.** `none`/`minimal` are rejected by the current Codex
 tool config (incompatible with the `web_search` tool) — never emit them.
+**Codex effort ceiling is `max`, NOT `ultra`.** The effort enum ascends
+`low < medium < high < xhigh < max < ultra`, but `ultra` = "maximum reasoning with
+**automatic task delegation**" — it auto-spawns tool-using sub-agents, which breaks
+the read-only advisory guarantee. Never emit `ultra`; `max` is the top rung.
+**Coverage is intentional, not exhaustive** — the ladder optimizes review quality by
+risk tier, not minimum cost or full-lineup coverage. `gpt-5.5` (frontier), `gpt-5.4`
+(strong everyday), and `gpt-5.6-luna` (fast/affordable) are deliberately unmapped;
+add them only if you introduce a cost/latency policy dimension.
 
 ### Gemini ladder (`--model "<name> (<effort>)"` — effort is baked into the name)
 
@@ -118,7 +127,7 @@ nothing else changes.
 **Fixed overrides (never run the classifier for these):**
 
 - **Planning** (overall plan, implementation plan, pre-work) → **both peers**, codex
-  `gpt-5.5 @ xhigh` + gemini `Gemini 3.1 Pro (High)`. Define "planning" narrowly:
+  `gpt-5.6-sol @ max` + gemini `Gemini 3.1 Pro (High)`. Define "planning" narrowly:
   an explicit implementation/architecture plan or task decomposition requested
   before code changes — **not** every passing "I'll do X" thought, which would
   burn Gemini quota.
@@ -252,7 +261,7 @@ consistent).
 the verdict UP one rung** (the conservative default on a borderline `normal`/`big`);
 blocker → floor `small`; **explicit user override wins** ("pair on max", `--tier big`,
 "three-way", a named model) → skip the classifier. Surface the verdict + chosen peers in one line before
-dispatching ("Classified review as `big` → codex gpt-5.5@xhigh + gemini Pro High").
+dispatching ("Classified review as `big` → codex gpt-5.6-sol@max + gemini Pro High").
 
 ---
 
@@ -315,7 +324,7 @@ cat "$J.out"; cat "$J.done"   # read result + EXIT=<code>;  cat "$J.err" to clas
 In Claude Code's REPL, launch (step 3) and poll (step 4) as **separate** `sh()`
 calls — launch returns immediately, then poll `[ -f "$J.done" ]` until the sentinel
 appears. **Never run the CLI as one long blocking/background `sh()` call** (e.g.
-`sh('codex exec …', 480000)`): an `xhigh`/Pro-High run routinely outlasts the tool
+`sh('codex exec …', 480000)`): a `max`/Pro-High run routinely outlasts the tool
 timeout, the call returns empty, and the result is lost even though the peer
 finished — the exact failure this pane+sentinel pattern prevents. **Last resort if
 zellij is unavailable:** run the adapter's `<PEER COMMAND>` directly and capture its
@@ -694,7 +703,7 @@ On first invocation:
 
 ## Portability — swapping backends
 
-Designed to be open-sourced (`iotashan/llm-pair`). Bindings:
+Designed to be open-sourced (`iotashan-llc/llm-pair`). Bindings:
 
 - **Classifier** — Claude Code's REPL `haiku()`. Any fast model with structured
   output works; keep the schema, swap the call.
@@ -718,7 +727,7 @@ Designed to be open-sourced (`iotashan/llm-pair`). Bindings:
   the tier nudge) is answerable from the vendored text with zero extra tool calls; a
   per-turn skill-load would tax the path that fires on EVERY pairing and defeat the
   cost-calibration mandate, and would break self-containment (a downstream user of
-  `iotashan/llm-pair` with no prompt skills installed loses nothing). To re-tune the vendored blocks, a maintainer consults the
+  `iotashan-llc/llm-pair` with no prompt skills installed loses nothing). To re-tune the vendored blocks, a maintainer consults the
   prompt skills (`prompt-engineer`, `enhance-prompt`, `llm-prompt-optimizer`,
   `prompt-engineering-patterns`) **offline** and pastes improved text back in — never a
   runtime call-out, and never running their code inside the read-only / redaction /

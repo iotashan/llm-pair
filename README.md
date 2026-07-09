@@ -38,8 +38,8 @@ A cheap classifier sizes each task to a **(model, effort) tier**, per backend:
 | `skip`    | — (no pairing)        | —      | —                           |
 | `trivial` | `gpt-5.3-codex-spark` | low    | `Gemini 3.5 Flash (Low)`    |
 | `small`   | `gpt-5.4-mini`        | low    | `Gemini 3.5 Flash (Medium)` |
-| `normal`  | `gpt-5.5`             | medium | `Gemini 3.1 Pro (Low)`      |
-| `big`     | `gpt-5.5`             | xhigh  | `Gemini 3.1 Pro (High)`     |
+| `normal`  | `gpt-5.6-terra`       | medium | `Gemini 3.1 Pro (Low)`      |
+| `big`     | `gpt-5.6-sol`         | max    | `Gemini 3.1 Pro (High)`     |
 
 …with fixed rules: **plans always run at max**, **blockers floor at `small`**, and
 any risk signal (auth, migrations, money, shared libs, infra, public API, security,
@@ -79,7 +79,7 @@ See [`SKILL.md`](./SKILL.md) for the full operating contract.
 Via [`npx skills`](https://github.com/vercel-labs/skills):
 
 ```bash
-npx skills add iotashan/llm-pair
+npx skills add iotashan-llc/llm-pair
 ```
 
 Or manually — drop `llm-pair/` into your shared `~/.agents/skills/` store and
