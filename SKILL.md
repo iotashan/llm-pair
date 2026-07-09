@@ -1,6 +1,6 @@
 ---
 name: llm-pair
-version: 1.1.0
+version: 1.1.1
 description: >-
   Use for ALL pairing with peer LLMs. Triggers: the user says "pair with codex",
   "pair with gemini", "pair with the LLM", "llm-pair", "three-way", or
@@ -218,7 +218,7 @@ you just redacted. If persistence is unavoidable, use a coordinator-private dir
 **outside** `/tmp/llmpair-*` (`mkdir -m700`; file `chmod 600`), never named in any peer
 command, prompt, or `--add-dir`, and delete it when the session ends. Redacted content
 is all that may appear in: `/tmp` prompt/output
-files, zellij pane scrollback, stderr/`.err` files, parse-error messages. After
+files, stderr/`.err` files, parse-error messages. After
 assembling a peer prompt, **grep it for known sensitive tokens** before dispatch
 (belt-and-suspenders). Re-expand placeholders **only** in Claude's integrated
 output, file edits, and user-facing summaries — never echo the map back into a peer
@@ -268,91 +268,52 @@ dispatching ("Classified review as `big` → codex gpt-5.6-sol@max + gemini Pro 
 ## The shared dispatch engine (DRY core)
 
 Both peers run through the **same** mechanism — only the command line differs (see
-[adapters](#peer-adapters)). Every peer call runs its CLI **inside a zellij pane**
-(see the `zellij` skill), writing to **local `/tmp`** with a done-sentinel, then
-polls `/tmp`. The user watches the panes; the coordinator reads the files.
+[adapters](#peer-adapters)). Each peer call: stage a **redacted** prompt file, run
+the peer CLI with its **stdout/stderr redirected to files**, then read those files.
+**Reading the result from the file — not the call's return value — is the core
+reliability guarantee:** a long `max`/Pro-High run can outlast a tool timeout and
+return empty, but its output is already on disk.
 
-> **⚠️ Staging must hit the REAL filesystem — the zellij pane is a SEPARATE OS
-> process.** Write `$J.prompt.txt` (+ `$J.schema.json` for Codex) + `$J.sh` with a
-> mechanism that writes REAL files: your **file-write tool** or a **real-shell
-> heredoc** (`cat > $J.sh <<'EOF'`). Confirm with `ls -la $J.sh` from a separate
-> shell BEFORE `zellij run`; if it's missing there, the pane can't see it either.
-> For prompts containing a diff / backticks / `$`, write the prompt with the
-> file-write tool (raw content, no escaping) — never interpolate a diff into a shell
-> string or a REPL template literal.
-
-> **⚠️ Do NOT use `2> >(tee err >&2)` + `--close-on-exit`.** The async `tee` is a
-> separate process that gets **killed when the pane closes**, before it flushes —
-> so `$J.err` is unreliably created (verified failure mode). Use the robust pattern
-> below: run the CLI **backgrounded** with plain `> out 2> err`, `tail -f` the err
-> file for the live view, then `wait` for the real exit code.
+> **⚠️ Stage with the file-write tool, never shell-string interpolation.** Write
+> `$J.prompt.txt` (+ `$J.schema.json` for Codex) with your **file-write tool** — raw
+> content, no escaping. Never interpolate a diff / backticks / `$` into a shell string
+> or a REPL template literal. PREFLIGHT before launch: `$J.prompt.txt` exists &
+> non-empty; (Codex) `$J.schema.json` is valid JSON; the peer binary is on PATH. A
+> missing/empty prompt is a STAGING bug, not peer-unavailable.
 
 ```bash
-J="$(mktemp -u /tmp/llmpair-<peer>-XXXXXX)"   # PER PEER + unique. In 3-way, codex & gemini
-                                              # MUST get DISTINCT $J or they clobber each other's
-                                              # prompt/out/done (correctness + cross-peer leak).
-# PREFLIGHT before launch: $J.prompt.txt exists & non-empty; (Codex) $J.schema.json is valid
-# JSON; the peer binary is on PATH. A missing/empty prompt is a STAGING bug, not peer-unavailable.
+J="$(mktemp -u /tmp/llmpair-<peer>-XXXXXX)"   # PER PEER + unique. In a 3-way, codex &
+                                              # gemini MUST get DISTINCT $J or they
+                                              # clobber each other's files (correctness
+                                              # + cross-peer leak).
 # 1. Write $J.prompt.txt (REDACTED for third-party peers) with the file-write tool.
 #    For Codex also write $J.schema.json (its --output-schema needs a file).
-# 2. Job script — robust background + tail + wait (no process substitution):
-cat > "$J.sh" <<EOF
-#!/bin/bash
-echo "START \$(date)" > "$J.log"
-echo ">>> <peer> LIVE — progress streams below; final -> $J.out"
-: > "$J.out"; : > "$J.err"                     # pre-create: BSD/macOS 'tail -f' exits if file is absent
-<PEER COMMAND>  > "$J.out" 2> "$J.err" &      # see adapter for <PEER COMMAND>
-P=\$!
-tail -f "$J.err" 2>/dev/null &                # live view in the pane (file already exists)
-T=\$!
-wait \$P; E=\$?
-sleep 1; kill \$T 2>/dev/null
-echo "EXIT=\$E" > "$J.done"
-echo ">>> <peer> done (exit=\$E)."
-EOF
-# 3. Launch in a NEW PANE of the CURRENT zellij session (reuse it; never churn).
-#    Omit --close-on-exit so the pane lingers for reading and the tail isn't killed
-#    mid-flush. Stack onto the shell pane so it doesn't steal focus (zellij skill):
-zellij run --name "<peer>-$$" -- bash "$J.sh"
-#    zellij action stack-panes -- <shell-pane-id> <new-pane-id>
-#    zellij action focus-pane-id <shell-pane-id>
-# 4. POLL the sentinel from SEPARATE short calls (polling never races the command):
-for i in $(seq 1 300); do [ -f "$J.done" ] && break; sleep 2; done
-cat "$J.out"; cat "$J.done"   # read result + EXIT=<code>;  cat "$J.err" to classify a failure
+# 2. Run the peer, redirecting BOTH streams to files + writing a done-sentinel:
+<PEER COMMAND> > "$J.out" 2> "$J.err"; echo "EXIT=$?" > "$J.done"   # <PEER COMMAND>: see adapter
+# 3. Read the RESULT FROM THE FILE (never the call's return value):
+cat "$J.out"; cat "$J.done"    # + cat "$J.err" to classify a failure
 ```
 
-In Claude Code's REPL, launch (step 3) and poll (step 4) as **separate** `sh()`
-calls — launch returns immediately, then poll `[ -f "$J.done" ]` until the sentinel
-appears. **Never run the CLI as one long blocking/background `sh()` call** (e.g.
-`sh('codex exec …', 480000)`): a `max`/Pro-High run routinely outlasts the tool
-timeout, the call returns empty, and the result is lost even though the peer
-finished — the exact failure this pane+sentinel pattern prevents. **Last resort if
-zellij is unavailable:** run the adapter's `<PEER COMMAND>` directly and capture its
-stdout *through the call's return value* (`out = sh(<PEER COMMAND>)` — it already
-includes the `cat "$J.prompt.txt" | …` stdin plumbing) — never write
-the OUTPUT to a `/Volumes/*` file and read it back later (read-after-write lag).
+Run step 2 as a single `sh()` call. A short peer run returns inline; a long one the
+Claude Code harness **backgrounds** and delivers via a task-notification when it
+finishes. **Either way, read `$J.out` from disk** once `$J.done` exists — do **not**
+treat an empty call-return as "the peer said nothing." Reads of a just-written `$J.*`
+can transiently report "no such file" (filesystem/tool lag) — **re-read after a 1–2 s
+sleep** before concluding a peer produced nothing; a single failed read is NOT "peer
+unavailable."
 
-**Reliability notes (learned the hard way):**
+**Reliability notes:**
 
-- **`&` only survives inside a zellij pane, never from a plain `sh()` call.** The
-  REPL tool kills its child process tree when the call returns, so a `nohup … &` /
-  `disown` job started from `sh()` dies instantly. zellij `run` panes run under the
-  long-lived zellij *server*, so they persist — that's why detach goes through a pane,
-  not `nohup`.
-- **Reads of `$J.*` can transiently report "no such file"** for a second or two right
-  after creation (filesystem/tool lag). Before concluding a peer produced nothing,
-  **re-stat after a 1–2 s sleep** (or read once more) — a single failed read is NOT
-  "peer unavailable." Pairs with the preflight + pre-touch above.
-- **Never clean up with a glob that can match a still-needed file.** `rm -f
-  /tmp/llmpair-*` will delete the runner/prompt you just staged and leave the pane
-  running an empty script (silent empty-output failure). Clean by explicit paths, or
-  `rm -rf` a per-peer `mktemp -d` directory.
-- **Close finished peer panes** (`zellij action close-pane --pane-id <id>`) so they
-  don't accumulate across pairings.
+- **Read the file, not the return value.** Output is on disk the moment the peer
+  exits; the `sh()` return value is unreliable for long runs. This is the whole reason
+  for the `> $J.out` redirect + `$J.done` sentinel.
+- **Clean up by explicit path, never a glob** that can match a still-needed file (`rm
+  -f /tmp/llmpair-*` mid-run deletes a staged prompt). Prefer a per-peer `mktemp -d`
+  dir and `rm -rf` it when done.
 
-**For three-way work, launch BOTH panes (codex + gemini) in parallel**, then poll
-both sentinels. Partial completion is fine: if one peer is still running past a
-sane deadline or errored, proceed with whoever returned (see availability).
+**For three-way work, run BOTH peers** (codex + gemini) with DISTINCT `$J`, then read
+both `$J.out`. Partial completion is fine: if one errored or is still running past a
+sane deadline, proceed with whoever returned (see availability).
 
 **Output verification — never confabulate:** if a peer's output is empty / unusable,
 retry once (fresh call); if it still fails, report honestly and proceed with the
@@ -390,7 +351,7 @@ consensus, and fallback are shared and unchanged across adapters.
   dir, worktree). Trade-off: removes the fail-fast "not a repo" guard, so a typo'd
   `-C` won't fail fast — double-check it.
 - **prompt via stdin + `-`** — avoids quoting hell for large diffs.
-- Codex puts reasoning/progress on **stderr** (`$J.err`, shown live via `tail`); the
+- Codex puts reasoning/progress on **stderr** (`$J.err`); the
   clean final JSON is on **stdout** (`$J.out`). Don't use `--json` (noisy event
   stream).
 - **Availability:** unavailable if `codex` not on PATH; or `$J.done` exit ≠ 0; or
@@ -467,7 +428,7 @@ consensus, and fallback are shared and unchanged across adapters.
 Do **not** draft a plan and hand it over for critique — that anchors the peers on
 your framing. Instead:
 
-1. **Dispatch both peers' independent drafts in parallel panes** with the **same
+1. **Dispatch both peers' independent drafts in parallel** with the **same
    source material** (ticket, requirements, relevant code — **redacted**) but **not
    your draft**. Build BOTH prompts from the skeleton with the **planning** role line
    and the **plan** contract — `--output-schema` for Codex, the SAME schema pasted

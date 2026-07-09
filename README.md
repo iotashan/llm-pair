@@ -149,7 +149,7 @@ nothing else changes.
   output works; keep the schema, swap the call).
 - **Peer backends** — the `codex` CLI (`codex exec`) and the `agy` CLI, each a
   concrete *adapter* (command template, output mode, read-only enforcement,
-  availability detection) over a shared zellij-pane dispatch engine.
+  availability detection) over a shared file-based dispatch engine.
 - **Fallback** — any Opus-capable agent, used only when both external peers are
   unavailable.
 - **Prompt templates** — the peer-prompt skeleton, role lines, task output contracts,

@@ -21,7 +21,7 @@ the contract and, ideally, dogfooding it in a live Claude Code session.
 The coordinator agent (Claude) pairs with up to two **read-only** peer LLMs — Codex
 (`codex exec`) and Gemini (`agy`) — sizing each peer's `(model, effort)` to the task
 via a cheap classifier, fanning out to BOTH only for complex work (planning + `big`)
-to reconcile a three-way consensus. Peers are dispatched through a zellij pane; PII/
+to reconcile a three-way consensus. Peers run as read-only CLI calls with file-redirected output; PII/
 secrets are redacted to stable placeholders before any third-party peer sees them.
 
 ## Where to edit — SKILL.md map
@@ -33,7 +33,7 @@ Section headers are stable anchors. The parts you'll touch most:
   second peer joins* = edit the fan-out matrix, nothing else.
 - **Non-negotiable safety rules** — read-only enforcement, cwd-pinning, redaction,
   no confabulation. Don't weaken these casually.
-- **The shared dispatch engine** — the zellij-pane launch + sentinel-poll recipe all
+- **The shared dispatch engine** — the file-redirected run + read-back recipe all
   adapters share (write prompt file → job script → new pane → poll sentinel).
 - **Peer adapters** — Codex / Gemini / Opus-fallback, each a command template +
   output mode + availability check over the shared engine.

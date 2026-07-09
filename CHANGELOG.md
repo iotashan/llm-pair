@@ -5,6 +5,18 @@ All notable changes to the `llm-pair` skill are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-07-09
+
+### Changed
+
+- **Dispatch engine is now backend-agnostic and zellij-free.** Peers run as direct
+  read-only CLI calls with **stdout/stderr redirected to files**; the coordinator
+  reads the result from disk (never the call's return value), so a long run that
+  outlasts a tool timeout is not lost. Removed the zellij-pane orchestration
+  (session detection, pane stacking, `--close-on-exit`, live-tail) — it added
+  operational complexity and could silently stall. No change to redaction, structured
+  output, availability detection, consensus, or the fallback.
+
 ## [1.1.0] - 2026-07-09
 
 ### Changed
